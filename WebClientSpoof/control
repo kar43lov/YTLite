@@ -1,0 +1,8 @@
+Package: com.pgmac.webclientspoof
+Name: WebClientSpoof
+Version: 0.1
+Architecture: iphoneos-arm64
+Description: Test tweak: spoof the /player InnerTube client to WEB (web_safari)
+Author: pgmac
+Maintainer: pgmac
+Section: Tweaks
