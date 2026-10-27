@@ -10,6 +10,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <stdio.h>
 
 static const int        kWebClientNameEnum = 1;  // WEB
 static NSString * const kWebClientVersion  = @"2.20260708.00.00";
@@ -18,21 +19,51 @@ static NSString * const kWebUserAgent =
     @"(KHTML, like Gecko) Version/15.5 Safari/605.1.15";
 static NSString * const kPlayerPath = @"/youtubei/v1/player";
 
+// Markers go to stderr (reaches `devicectl ... --console`), NSLog, and a file in the app
+// container (pulled later via `devicectl device copy from --domain-type appDataContainer`).
+static void WSLogLine(NSString *line) {
+    if (!line) return;
+    fprintf(stderr, "%s\n", line.UTF8String);
+    NSLog(@"%@", line);
+    @try {
+        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        if (!dir) return;
+        NSString *path = [dir stringByAppendingPathComponent:@"webspoof.log"];
+        NSString *stamped = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], line];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) { [fh seekToEndOfFile]; [fh writeData:[stamped dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+        else { [stamped writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil]; }
+    } @catch (__unused NSException *e) {}
+}
+#define WSLOG(fmt, ...) WSLogLine([NSString stringWithFormat:(fmt), ##__VA_ARGS__])
+
 // ---- request context: player-scoped concrete decorator (confirmed: ...Impl, decorateContext: v24@0:8@16) ----
 %hook YTPlayerInnerTubeContextDecoratorImpl
 - (void)decorateContext:(id)context {
     %orig;  // app builds its normal context (auth/visitor intact); then override client only
     @try {
         id client = [context valueForKey:@"client"];
-        if (!client) { NSLog(@"[WebSpoof] REQ: context has no client"); return; }
-        [client setValue:@(kWebClientNameEnum) forKey:@"clientName"];
-        [client setValue:kWebClientVersion     forKey:@"clientVersion"];
-        [client setValue:kWebUserAgent          forKey:@"userAgent"];
-        // read back ACTUALLY stored values, not constants
-        NSLog(@"[WebSpoof] REQ stored clientName=%@ clientVersion=%@ uaSet=%d",
-              [client valueForKey:@"clientName"], [client valueForKey:@"clientVersion"],
-              ([[client valueForKey:@"userAgent"] length] > 0));
-    } @catch (__unused NSException *e) { NSLog(@"[WebSpoof] REQ decorate failed at setValue"); }
+        if (!client) { WSLOG(@"[WebSpoof] REQ: context has no client"); return; }
+        // Hypothesis (not yet proven): `client` may be reused across requests, so mutating it in
+        // place could poison /browse,/next. Work on a copy and swap it in; capture evidence below.
+        id beforeName = [client valueForKey:@"clientName"];
+        id beforeVer  = [client valueForKey:@"clientVersion"];
+        id clientCopy = [client copy];
+        BOOL distinctCopy = (clientCopy && clientCopy != client);
+        if (!clientCopy) { WSLOG(@"[WebSpoof] REQ: client copy failed"); return; }
+        [clientCopy setValue:@(kWebClientNameEnum) forKey:@"clientName"];
+        [clientCopy setValue:kWebClientVersion     forKey:@"clientVersion"];
+        [clientCopy setValue:kWebUserAgent          forKey:@"userAgent"];
+        [context setValue:clientCopy forKey:@"client"];
+        id after = [context valueForKey:@"client"];
+        // original client's fields must be unchanged by our write (safe scalar/string snapshots)
+        BOOL origUnchanged = [[client valueForKey:@"clientName"] isEqual:beforeName] &&
+                             ([beforeVer isEqual:[client valueForKey:@"clientVersion"]] ||
+                              (beforeVer == nil && [client valueForKey:@"clientVersion"] == nil));
+        WSLOG(@"[WebSpoof] REQ before name=%@ ver=%@ | after name=%@ ver=%@ | distinctCopy=%d origUnchanged=%d",
+              beforeName, beforeVer, [after valueForKey:@"clientName"], [after valueForKey:@"clientVersion"],
+              distinctCopy, origUnchanged);
+    } @catch (__unused NSException *e) { WSLOG(@"[WebSpoof] REQ decorate failed at setValue"); }
 }
 %end
 
@@ -53,7 +84,7 @@ static void WSApplyPlayerHeaders(id fetcher) {
 
         NSString *beforeUA = [req valueForHTTPHeaderField:@"User-Agent"];
         NSString *beforeCN = [req valueForHTTPHeaderField:@"X-Youtube-Client-Name"];
-        NSLog(@"[WebSpoof] HDR before /player host=%@ uaIsWeb=%d clientName=%@",
+        WSLOG(@"[WebSpoof] HDR before /player host=%@ uaIsWeb=%d clientName=%@",
               host, [beforeUA isEqualToString:kWebUserAgent], beforeCN);
 
         ((void(*)(id,SEL,id,NSString *))objc_msgSend)(fetcher, @selector(setRequestValue:forHTTPHeaderField:), kWebUserAgent, @"User-Agent");
@@ -65,11 +96,11 @@ static void WSApplyPlayerHeaders(id fetcher) {
         BOOL uaOK  = [[after valueForHTTPHeaderField:@"User-Agent"] isEqualToString:kWebUserAgent];
         BOOL cnOK  = [[after valueForHTTPHeaderField:@"X-Youtube-Client-Name"] isEqualToString:@"1"];
         BOOL verOK = [[after valueForHTTPHeaderField:@"X-Youtube-Client-Version"] isEqualToString:kWebClientVersion];
-        NSLog(@"[WebSpoof] HDR readback uaOK=%d clientNameOK=%d versionOK=%d", uaOK, cnOK, verOK);
+        WSLOG(@"[WebSpoof] HDR readback uaOK=%d clientNameOK=%d versionOK=%d", uaOK, cnOK, verOK);
         // mark done only after confirmed success, so a failed first entry lets the second retry
         if (uaOK && cnOK && verOK)
             objc_setAssociatedObject(fetcher, kWSHeadersDone, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    } @catch (__unused NSException *e) { NSLog(@"[WebSpoof] HDR hook failed"); }
+    } @catch (__unused NSException *e) { WSLOG(@"[WebSpoof] HDR hook failed"); }
 }
 
 %hook GTMSessionFetcher
@@ -86,15 +117,15 @@ static void WSApplyPlayerHeaders(id fetcher) {
 // ---- response snapshot: once, at the parsed player-response consumption point ----
 static void WSLogResponse(id playerData) {
     @try {
-        if (!playerData) { NSLog(@"[WebSpoof] RESP: nil playerData"); return; }
+        if (!playerData) { WSLOG(@"[WebSpoof] RESP: nil playerData"); return; }
         id ps = [playerData valueForKey:@"playabilityStatus"];
         id status = ps ? [ps valueForKey:@"status"] : nil;
         id sd = [playerData valueForKey:@"streamingData"];
         BOOL hasHls = sd ? [[sd valueForKey:@"hasHlsManifestURL"] boolValue] : NO;
         id hlsN = sd ? [sd valueForKey:@"hlsFormatsArray_Count"] : nil;        // counts without materialising arrays
         id adaN = sd ? [sd valueForKey:@"adaptiveFormatsArray_Count"] : nil;
-        NSLog(@"[WebSpoof] RESP status=%@ hasHLS=%d hlsFormats=%@ adaptive=%@", status, hasHls, hlsN, adaN);
-    } @catch (__unused NSException *e) { NSLog(@"[WebSpoof] RESP snapshot failed"); }
+        WSLOG(@"[WebSpoof] RESP status=%@ hasHLS=%d hlsFormats=%@ adaptive=%@", status, hasHls, hlsN, adaN);
+    } @catch (__unused NSException *e) { WSLOG(@"[WebSpoof] RESP snapshot failed"); }
 }
 
 %hook YTPlayerResponse
@@ -119,12 +150,13 @@ static void WSLogResponse(id playerData) {
 
 // ---- ctor: confirm classes AND the exact selectors/targets exist in this build ----
 %ctor {
+    fprintf(stderr, "[WebSpoof] ctor reached\n");  // raw marker before any ObjC/NSString work
     Class dec   = objc_getClass("YTPlayerInnerTubeContextDecoratorImpl");
     Class resp  = objc_getClass("YTPlayerResponse");
     Class fetch = objc_getClass("GTMSessionFetcher");
-    NSLog(@"[WebSpoof] ctor classes: decoratorImpl=%d response=%d fetcher=%d clientInfo=%d",
+    WSLOG(@"[WebSpoof] ctor classes: decoratorImpl=%d response=%d fetcher=%d clientInfo=%d",
           dec != nil, resp != nil, fetch != nil, objc_getClass("YTIClientInfo") != nil);
-    NSLog(@"[WebSpoof] ctor selectors: decorate=%d respShort=%d respRental=%d respLong=%d fetchCompletion=%d fetchDelegate=%d setHdr=%d",
+    WSLOG(@"[WebSpoof] ctor selectors: decorate=%d respShort=%d respRental=%d respLong=%d fetchCompletion=%d fetchDelegate=%d setHdr=%d",
           [dec instancesRespondToSelector:@selector(decorateContext:)],
           [resp instancesRespondToSelector:@selector(initWithPlayerData:responseDate:offlineStateDate:mutableState:trailer:)],
           [resp instancesRespondToSelector:@selector(initWithPlayerData:responseDate:offlineStateDate:mutableState:trailer:offlineRentalActivated:)],
